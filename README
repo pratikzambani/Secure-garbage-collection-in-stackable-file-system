@@ -1,0 +1,116 @@
+Secure garbage file system
+
+The purpose of this implementation is to add secure garbage functionality to sgfs stackable file system.
+
+http://www3.cs.stonybrook.edu/~ezk/cse506-s18/hw2.txt
+
+------------------------------------------
+Steps to setup - 
+------------------------------------------
+
+Goto /usr/src/hw2-pzambani/
+
+1. Unmount if mounted 
+umount /mnt/sgfs/
+
+2. Remove sgfs module if loaded
+rmmod sgfs
+
+3. Build sgfs codebase (inside /usr/src/hw2-pzambani/)
+make
+
+4. Install sgfs module into kernel
+insmod ./fs/sgfs/sgfs.ko
+
+5. Mount
+mount -t sgfs -o key=password hw2/sgfs/ /mnt/sgfs/   (with key)
+mount -t sgfs hw2/sgfs/ /mnt/sgfs/                   (without key)
+
+6. cd hw2/
+cc sgctl.c -o sgctl
+
+7. cp sgctl /mnt/sgfs/dir1/dir2  (copy user program binary to some folder inside mounted sgfs filesytem)
+
+--------------------------------------------
+Design
+--------------------------------------------
+
+SGFS filesystem is mounted on some user specified path and if the user deletes any file of sgfs filesystem, then it needs to be encrypted and moved to a trash folder named ".sg" at the root directory of the filesystem. At the time of mounting, user needs to specify a encryption key using -o key=password param as part of mount command. This key is optional and if the user doesn't specify the key then deleted files will be moved to .sg without encryption. During mount time, sgfs_read_super is called and here I check if .sg already exists. If it doesnt then .sg folder is created using kern_path_create and vfs_mkdir APIs.
+
+When user deletes any file, sgfs_unlink method is called. If the file deleted is already in .sg then it is deleted permanently. Otherwise, the file is encrypted using user provided key during mount time and then moved to .sg folder. To support keys of random length, I have hashed the key using md5 which gives a fixed 16byte digest of the key. To encrypt, I have used block cipher mode. Encryption algorithm expects data which needs to be encrypted to be a multiple of AES_KEY_SIZE which is 16. Since, user files might not always be a multiple of 16, I have added padding at the end to make it a multiple of 16. At the time of decryption, one needs to know the encryption key and how many bytes were padded to decrypt properly. User can also mount with one key then unmount and then mount with another key. Files should not be decrypted in such a scenario. Hence, I have added padding size and the hashed key to the encrypted file and form the first 17 bytes of the encrypted file.
+
+File sizes in .sg folder - 
+
+Encrypted file size will then be 1 (for padding) + 16 (for hashed key) + file_size + padding
+e.g plain file size of 5 will become 1 + 16 + 5 + 11 (since we need to add 11 to 5 to make it nearest multiple of 16) = 33 bytes in encrypted form.
+Padding will always be between 0 - 15 bytes and hence this can encoded in a single byte.
+
+If user doesnt specify any key, then file in .sg folder will be the same size as original file.
+
+File names in .sg folder - 
+
+Encrypted files in .sg folder will have .enc extension whereas plain text wont.
+Timestamp at the time of deleting file is also part of the name of file in .sg as well as owner of the file. Including owner info simplifies showing list of files only owned by the user when ls command is run inside .sg folder. 
+e.g 1522796910007148607-0-file1.txt.enc     (with encryption)
+e.g 1522796910007125111-0-plain.txt         (without encryption)
+
+To restore, a user program called sgctl has been implemented which calls a new ioctl command. This ioctl call is intercepted by sgfs_unlocked_ioctl function in file.c Here we check if the ioctl command issued is the one which needs to restore the deleted file from .sg folder to the current working directory of the user from where sgctl was called. If the file needs to be restored, I check its extension to see where it was encrypted or plaintext to move accordingly. In case of encrypted files, I check the key provided by user during mount time, hash it and compare with the hashed key part of the encrypted file. If the key matches, then we proceed to decrypt it. The first byte of encrypted file gives us the padding size and the next 16 bytes give the hashed key which was used to encrypt the file. A new decrypted file is created in the present working directory of the user (ie. the directory from where sgctl was called. Note - this needs to be inside sgfs filesystem e.g /mnt/sgfs/dir1/dir2) which contains the original content of the user file with the same name. Name is recreated from the encrypted filename by removing timestamp, owner info and .enc extension.
+This new file has the same file size as the original deleted file. 
+
+The file present in .sg folder is deleted only if the restore operation succeds, otherwise it is not. Eg scenario when user provides different key than the one used for encryption. Note - valid pathname needs to be provided to the sgctl binary, it crashes otherwise. I have not added checks in the user program to see if the provided filename is valid.
+
+Files deleted by the users are moved to .sg folder. When user issues ls command inside .sg, only files owned by the user are listed. Files inside .sg folder contain owner info as part of the filename and this is used to only list relevant files. 
+
+--------------------------------------------
+Files modified as part of the assignment - 
+--------------------------------------------
+
+SGFS kernel module
+
+1. main.c - sgfs_mount is called on mounting. Here I am parsing key option used for encrypting files later. Key parameter is optional and if the user doesn't specify key then files will be moved to .sg folder as is without encryption. Mount time parameters are parsed similar to what encryptfs does. .sg folder is created if not already present as explained above. 
+
+2. inode.c - sgfs_unlink function is modified to implement the desired behaviour. If the file deleted is not from .sg folder, then it is moved (encrypted or plain text depending on whether key is provided) to .sg folder and the original file is deleted. I have added functions to open/close/read/write files as implemented in assignment1 here. goto statements have been used to cleanup - free the buffers, handle ref count, unlock etc. 
+
+3. file.c - to restore the file from .sg, sgctl binary is used which passes the control to sgfs_unlocked_ioctl. Here I check if the ioclt is for restore command and then proceed with decryption if file is encrypted. If the restoration succeds, then file from .sg folder is deleted. sgfs_readdir has been modified to only list files owned by the user inside .sg folder.
+
+4. sgfs.h - libraries have been imported for crypto functionality and added new iotcl command defination. 
+
+User program (/usr/src/hw2-pzambani/hw2)
+
+1. sgctl.c - user program that takes an input filename using -u parameter. It calls ioctl with fd of the user provided file and restore command.
+2. sgctl.h - defines the new ioctl command to restore file from .sg folder
+
+
+-------------------------------------------
+Typical workflow
+-------------------------------------------
+
+Setup as mentioned above
+
+1. cd /mnt/sgfs
+2. echo "abcd" > file1.txt                        (created file with size 5)
+3. yes "some text" | head -n 100 > f100.txt       (creates file with size 1000)
+4. rm -f file1.txt
+5. rm -f f100.txt
+Files are now deleted from pwd and new files created in .sg
+6. cd .sg/
+7. ls 
+Check two files with file size 33 and 1025 respectively with names as explained above in case of encryption
+otherwise two files with file size 5 and 1000 without .enc extension
+8. cd /mnt/sgfs/dir1/dir2
+9. ./sgctl -u /mnt/sgfs/.sg/1522796910007148607-0-file1.txt.enc
+10. ./sgctl -u /mnt/sgfs/.sg/1522796910007141111-0-f100.txt.enc
+New files should be visible in current folder with file1.txt and f100.txt names containing original contents of the files. 
+Files should have been deleted from .sg folder. 
+
+-------------------------------------------
+References
+-------------------------------------------
+
+Kernel source code hosted on elixir and fsl
+
+1. https://elixir.bootlin.com/linux/latest/source/lib/parser.c
+2. https://elixir.bootlin.com/linux/latest/source/fs/ecryptfs/main.c#L256
+3. https://kernel.readthedocs.io/en/sphinx-samples/crypto-API.html
+4. http://lxr.fsl.cs.sunysb.edu/linux/source/include/linux/fs_struct.h#L34
+5. https://tuxthink.blogspot.com/2011/01/creating-ioctl-command.html
